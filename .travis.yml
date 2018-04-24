@@ -1,0 +1,38 @@
+branches:
+  only:
+    - staging
+    - trying
+sudo: false
+os:
+  - linux
+  - osx
+env:
+  - FEATURES= RUSTFMT=false
+  - FEATURES= RUSTFMT=true
+  - FEATURES=nightly RUSTFMT=false
+language: rust
+rust:
+  - stable
+  - beta
+  - nightly
+matrix:
+  allow_failures:
+    - rust: nightly
+  exclude:
+    - os: osx
+      env: "FEATURES= RUSTFMT=true"
+    - rust: stable
+      env: "FEATURES=nightly RUSTFMT=false"
+    - rust: beta
+      env: "FEATURES= RUSTFMT=true"
+    - rust: beta
+      env: "FEATURES=nightly RUSTFMT=false"
+    - rust: nightly
+      env: "FEATURES= RUSTFMT=false"
+    - rust: nightly
+      env: "FEATURES= RUSTFMT=true"
+before_install:
+  - chmod +x ./.travis-build.sh
+  - chmod +x ./.travis-install-deps.sh
+  - ./.travis-install-deps.sh
+script: ./.travis-build.sh

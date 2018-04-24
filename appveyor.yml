@@ -1,0 +1,26 @@
+branches:
+  only:
+    - staging
+    - trying
+image: Visual Studio 2017
+environment:
+  matrix:
+    - FEATURES:
+      DEFAULT_TOOLCHAIN: stable
+    - FEATURES:
+      DEFAULT_TOOLCHAIN: beta
+    - FEATURES: nightly
+      DEFAULT_TOOLCHAIN: nightly
+matrix:
+  allow_failures:
+    - DEFAULT_TOOLCHAIN: nightly
+install:
+  - SET PATH=%USERPROFILE%\.cargo\bin;%PATH%
+  - ps: Start-FileDownload https://win.rustup.rs -FileName rustup-init.exe
+  - rustup-init.exe -vy --no-modify-path --default-toolchain %DEFAULT_TOOLCHAIN%
+  - cargo -vV
+  - rustc -vV
+  - rustdoc -vV
+build_script:
+  - cargo build -vv --features "%FEATURES%"
+  - cargo doc --no-deps --features "$FEATURES"
