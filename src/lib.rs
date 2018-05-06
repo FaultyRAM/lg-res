@@ -94,12 +94,14 @@ impl<R: Read + Seek> Reader<R> {
     /// The input stream's position is moved to the beginning of the stream before any reads are
     /// performed.
     pub fn new(mut source: R) -> Result<Self, Error> {
-        let _ = source.seek(SeekFrom::Start(0)).map_err(Error::IO)?;
-        let file_header = FileHeader::from_reader(&mut source)?;
-        let _ = source
+        let file_header = source
+            .seek(SeekFrom::Start(0))
+            .map_err(Error::IO)
+            .and_then(|_| FileHeader::from_reader(&mut source))?;
+        let dir_header = source
             .seek(SeekFrom::Start(file_header.dir_header_offset()))
-            .map_err(Error::IO)?;
-        let dir_header = DirectoryHeader::from_reader(&mut source)?;
+            .map_err(Error::IO)
+            .and_then(|_| DirectoryHeader::from_reader(&mut source))?;
         let mut dir_list = Vec::with_capacity(dir_header.num_entries());
         let mut preload_list = Vec::with_capacity(dir_header.num_entries());
         for _ in 0..dir_header.num_entries() {
@@ -142,7 +144,7 @@ impl<R: Read + Seek> Reader<R> {
     /// determine if a resource file's directory list contains deleted entries.
     pub fn contains_id(&self, id: usize) -> bool {
         assert_ne!(id, 0);
-        self.directory_list.iter().any(|entry| entry.id() == id)
+        self.directory_list.iter().any(|entry| entry.is_deleted())
     }
 
     /// Returns `true` if a resource file's directory list contains "deleted" entries, or `false`
