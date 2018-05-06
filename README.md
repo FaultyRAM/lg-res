@@ -26,5 +26,5 @@ conditions.
 
 [1]: https://travis-ci.org/FaultyRAM/lg-res
 [2]: https://ci.appveyor.com/project/FaultyRAM/lg-res
-[2]: https://crates.io/crates/lg-res
-[3]: https://docs.rs/lg-res
+[3]: https://crates.io/crates/lg-res
+[4]: https://docs.rs/lg-res
