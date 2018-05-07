@@ -13,25 +13,27 @@ use std::io::Read;
 use std::{mem, str};
 use Error;
 
-bitflags! {
-    #[doc(hidden)]
-    pub struct ResourceFlags: u8 {
-        /// Indicates that a resource is stored using LZW compression.
-        const RDF_LZW = 0x01;
-        /// Indicates that a resource is a compound resource.
-        const RDF_COMPOUND = 0x02;
-        /// Reserved for future use.
-        const RDF_RESERVED = 0x04;
-        /// Indicates that a resource should be loaded into memory when the resource file
-        /// containing it is opened.
-        const RDF_LOADONOPEN = 0x08;
-        /// Indicates that a resource is on a virtual CD-ROM drive(?).
-        const RDF_CDSPOOF = 0x10;
-    }
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A resource file directory entry.
+pub struct DirectoryEntry {
+    /// The resource ID.
+    id: u16,
+    /// The length in bytes of the resource when loaded into memory.
+    decompressed_len: U24,
+    /// The resource flags.
+    flags: ResourceFlags,
+    /// The length in bytes of the resource when stored inside a resource file.
+    ///
+    /// "Compressed" is a misnomer; resources that are not compressed have the same value for both
+    /// decompressed and compressed length.
+    compressed_len: U24,
+    /// The resource type.
+    res_type: ResourceType,
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Resource types.
 pub enum ResourceType {
     /// Unknown resource type.
@@ -130,23 +132,33 @@ pub(crate) struct DirectoryHeader {
     data_offset: u32,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
-/// A resource file directory entry.
-pub(crate) struct DirectoryEntry {
-    /// The resource ID.
-    id: u16,
-    /// The uncompressed length of the resource in bytes.
-    uncompressed_len: U24,
-    /// The resource flags.
-    flags: ResourceFlags,
-    /// The compressed length of the resource in bytes.
-    compressed_len: U24,
-    /// The resource type.
-    res_type: ResourceType,
+#[derive(Clone, Debug)]
+/// A directory list where each entry is mapped to the file offset of its corresponding resource.
+pub(crate) struct DirectoryList {
+    /// The directory entries.
+    entries: Box<[DirectoryEntry]>,
+    /// The file offsets.
+    offsets: Box<[u64]>,
 }
 
-#[derive(Clone, Copy, Debug)]
+bitflags! {
+    #[doc(hidden)]
+    pub struct ResourceFlags: u8 {
+        /// Indicates that a resource is stored using LZW compression.
+        const RDF_LZW = 0x01;
+        /// Indicates that a resource is a compound resource.
+        const RDF_COMPOUND = 0x02;
+        /// Reserved for future use.
+        const RDF_RESERVED = 0x04;
+        /// Indicates that a resource should be loaded into memory when the resource file
+        /// containing it is opened.
+        const RDF_LOADONOPEN = 0x08;
+        /// Indicates that a resource is on a virtual CD-ROM drive(?).
+        const RDF_CDSPOOF = 0x10;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// A 24-bit unsigned integer.
 struct U24([u8; 3]);
 
@@ -164,6 +176,71 @@ fn u32_from_le_array(array: [u8; 4]) -> u32 {
     let b1 = u32::from(array[1]) << 8;
     let b0 = u32::from(array[0]);
     b3 | b2 | b1 | b0
+}
+
+impl DirectoryEntry {
+    /// Reads a directory entry from an arbitrary input stream.
+    ///
+    /// The input stream is assumed to be positioned at the first byte of a directory entry.
+    pub(crate) fn from_reader<R: Read>(mut source: R) -> Result<Self, Error> {
+        let mut buffer = [0; mem::size_of::<Self>()];
+        source.read_exact(&mut buffer).map_err(Error::IO)?;
+        Ok(Self {
+            id: u16_from_le_array([buffer[0], buffer[1]]),
+            decompressed_len: U24::from_le_array([buffer[2], buffer[3], buffer[4]]),
+            flags: ResourceFlags::from_bits_truncate(buffer[5]),
+            compressed_len: U24::from_le_array([buffer[6], buffer[7], buffer[8]]),
+            res_type: ResourceType::from_u8(buffer[9]),
+        })
+    }
+
+    /// Returns the ID of a directory entry.
+    pub fn id(&self) -> usize {
+        self.id.into()
+    }
+
+    /// Returns `true` if this is a "deleted" directory entry, or `false` otherwise.
+    pub fn is_deleted(&self) -> bool {
+        self.id == 0
+    }
+
+    /// Returns the length in bytes of a directory entry's corresponding resource when loaded into
+    /// memory.
+    pub fn decompressed_len(&self) -> usize {
+        self.decompressed_len.value() as usize
+    }
+
+    /// Returns `true` if the resource associated with a directory entry is compressed, or `false`
+    /// otherwise.
+    pub fn is_compressed(&self) -> bool {
+        self.flags.contains(ResourceFlags::RDF_LZW)
+    }
+
+    /// Returns `true` if the resource associated with a directory entry is a compound resource, or
+    /// `false` otherwise.
+    pub fn is_compound_resource(&self) -> bool {
+        self.flags.contains(ResourceFlags::RDF_COMPOUND)
+    }
+
+    /// Returns `true` if the resource associated with a directory entry is intended to be loaded
+    /// into memory as soon as the resource file is opened, or `false` otherwise.
+    pub fn should_load_early(&self) -> bool {
+        self.flags.contains(ResourceFlags::RDF_LOADONOPEN)
+    }
+
+    /// Returns the length in bytes of a directory entry's corresponding resource when stored
+    /// inside a resource file.
+    ///
+    /// If the resource is not compressed, the value returned from this method is identical to that
+    /// returned from `DirectoryEntry::decompressed_len`.
+    pub fn compressed_len(&self) -> usize {
+        self.compressed_len.value() as usize
+    }
+
+    /// Returns the type of a directory entry's corresponding resource.
+    pub fn resource_type(&self) -> ResourceType {
+        self.res_type
+    }
 }
 
 impl ResourceType {
@@ -287,52 +364,42 @@ impl DirectoryHeader {
     }
 }
 
-impl DirectoryEntry {
-    /// Reads a directory entry from an arbitrary input stream.
+impl DirectoryList {
+    /// Reads a directory list from an arbitrary input stream.
     ///
-    /// The input stream is assumed to be positioned at the first byte of a directory entry.
-    pub(crate) fn from_reader<R: Read>(mut source: R) -> Result<Self, Error> {
-        let mut buffer = [0; mem::size_of::<Self>()];
-        source.read_exact(&mut buffer).map_err(Error::IO)?;
+    /// The input stream is assumed to be positioned at the first byte of a directory list.
+    pub(crate) fn from_reader<R: Read>(
+        directory_header: DirectoryHeader,
+        mut source: R,
+    ) -> Result<Self, Error> {
+        let mut resource_offset = directory_header.data_offset();
+        let mut entries = Vec::with_capacity(directory_header.num_entries());
+        let mut offsets = Vec::with_capacity(directory_header.num_entries());
+        for _ in 0..directory_header.num_entries() {
+            let entry = DirectoryEntry::from_reader(&mut source)?;
+            entries.push(entry);
+            offsets.push(resource_offset);
+            resource_offset += entry.compressed_len() as u64;
+        }
         Ok(Self {
-            id: u16_from_le_array([buffer[0], buffer[1]]),
-            uncompressed_len: U24::from_le_array([buffer[2], buffer[3], buffer[4]]),
-            flags: ResourceFlags::from_bits_truncate(buffer[5]),
-            compressed_len: U24::from_le_array([buffer[6], buffer[7], buffer[8]]),
-            res_type: ResourceType::from_u8(buffer[9]),
+            entries: entries.into_boxed_slice(),
+            offsets: offsets.into_boxed_slice(),
         })
     }
 
-    /// Returns the ID of a directory entry.
-    pub(crate) fn id(&self) -> usize {
-        self.id.into()
+    /// Returns a slice containing the list of directory entries.
+    pub(crate) fn entries(&self) -> &[DirectoryEntry] {
+        &self.entries
     }
 
-    /// Returns `true` if this is a "deleted" directory entry, or `false` otherwise.
-    pub(crate) fn is_deleted(&self) -> bool {
-        self.id() == 0
-    }
-
-    /// Returns the length in bytes of a directory entry's corresponding resource when loaded into
-    /// memory.
-    pub(crate) fn uncompressed_len(&self) -> usize {
-        self.uncompressed_len.value() as usize
-    }
-
-    /// Returns the flags associated with a directory entry's corresponding resource.
-    pub(crate) fn flags(&self) -> ResourceFlags {
-        self.flags
-    }
-
-    /// Returns the length in bytes of a directory entry's corresponding resource when stored on
-    /// physical media.
-    pub(crate) fn compressed_len(&self) -> usize {
-        self.compressed_len.value() as usize
-    }
-
-    /// Returns the type of a directory entry's corresponding resource.
-    pub(crate) fn resource_type(&self) -> ResourceType {
-        self.res_type
+    /// Returns the file offset for the resource that corresponds to the directory entry at a given
+    /// index.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if the given index is outside the bounds of the directory list.
+    pub(crate) fn offset_for_index(&self, index: usize) -> u64 {
+        self.offsets[index]
     }
 }
 

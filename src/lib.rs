@@ -38,10 +38,9 @@ extern crate failure;
 
 mod metadata;
 
-pub use metadata::{ResourceFlags, ResourceType};
+pub use metadata::{DirectoryEntry, ResourceFlags, ResourceType};
 
-use metadata::{DirectoryEntry, DirectoryHeader, FileHeader};
-use std::collections::HashMap;
+use metadata::{DirectoryHeader, DirectoryList, FileHeader};
 use std::fmt::{self, Debug, Formatter};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::str;
@@ -52,21 +51,16 @@ pub struct Reader<R> {
     source: R,
     /// A copy of the file header.
     file_header: FileHeader,
-    /// A file offset to the beginning of the data segment.
-    data_offset: u64,
-    /// A copy of the directory list.
-    directory_list: Box<[DirectoryEntry]>,
-    /// A list of previously-loaded resources.
-    resources: HashMap<usize, Resource>,
+    /// A copy of the directory list, where each entry is mapped to the file offset of its
+    /// corresponding resource.
+    directory_list: DirectoryList,
 }
 
 #[derive(Clone, Debug)]
 /// A resource.
 pub struct Resource {
-    /// The resource type.
-    res_type: ResourceType,
-    /// Resource flags.
-    flags: ResourceFlags,
+    /// A copy of the directory entry for this resource.
+    metadata: DirectoryEntry,
     /// The resource itself.
     data: Box<[u8]>,
 }
@@ -98,30 +92,16 @@ impl<R: Read + Seek> Reader<R> {
             .seek(SeekFrom::Start(0))
             .map_err(Error::IO)
             .and_then(|_| FileHeader::from_reader(&mut source))?;
-        let dir_header = source
+        source
             .seek(SeekFrom::Start(file_header.dir_header_offset()))
             .map_err(Error::IO)
-            .and_then(|_| DirectoryHeader::from_reader(&mut source))?;
-        let mut dir_list = Vec::with_capacity(dir_header.num_entries());
-        let mut preload_list = Vec::with_capacity(dir_header.num_entries());
-        for _ in 0..dir_header.num_entries() {
-            let entry = DirectoryEntry::from_reader(&mut source)?;
-            if !entry.is_deleted() && entry.flags().contains(ResourceFlags::RDF_LOADONOPEN) {
-                preload_list.push(entry);
-            }
-            dir_list.push(entry);
-        }
-        let mut reader = Self {
-            source,
-            file_header,
-            data_offset: dir_header.data_offset(),
-            directory_list: dir_list.into_boxed_slice(),
-            resources: HashMap::new(),
-        };
-        for entry in preload_list {
-            reader.load_resource(entry.id())?;
-        }
-        Ok(reader)
+            .and_then(|_| DirectoryHeader::from_reader(&mut source))
+            .and_then(|dir_header| DirectoryList::from_reader(dir_header, &mut source))
+            .map(|directory_list| Self {
+                source,
+                file_header,
+                directory_list,
+            })
     }
 
     /// Returns a byte slice containing the user comment associated with a resource file.
@@ -134,98 +114,42 @@ impl<R: Read + Seek> Reader<R> {
         self.file_header.comment_str()
     }
 
-    /// Returns `true` if a resource file contains a resource with the specified ID, or `false`
-    /// otherwise.
+    /// Returns the directory list for a resource file.
     ///
-    /// # Panics
-    ///
-    /// This method panics if the given ID is `0`, because that value is reserved for "deleted"
-    /// entries within a resource file's directory list. Use `Reader::contains_deleted_entries` to
-    /// determine if a resource file's directory list contains deleted entries.
-    pub fn contains_id(&self, id: usize) -> bool {
-        assert_ne!(id, 0);
-        self.directory_list.iter().any(|entry| entry.is_deleted())
+    /// The directory list is a series of entries where each entry contains some metadata for its
+    /// corresponding resource. Rather than storing file offsets, a resource file stores resource
+    /// lengths and assumes that resources are laid out in the same order as their corresponding
+    /// entries in the directory list.
+    pub fn directory_list(&self) -> &[DirectoryEntry] {
+        self.directory_list.entries()
     }
 
-    /// Returns `true` if a resource file's directory list contains "deleted" entries, or `false`
-    /// otherwise.
-    pub fn contains_deleted_entries(&self) -> bool {
-        self.directory_list.iter().any(|entry| entry.id() == 0)
-    }
-
-    /// Returns a reference to a given resource.
-    ///
-    /// This will load the resource into memory, if necessary.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if the given ID is `0`, because that value is reserved for "deleted"
-    /// entries within a resource file's directory list. Use `Reader::contains_deleted_entries` to
-    /// determine if a resource file's directory list contains deleted entries.
-    pub fn resource(&mut self, id: usize) -> Result<&Resource, Error> {
-        self.load_resource(id).map(move |_| {
-            if let Some(res) = self.loaded_resource(id) {
-                res
-            } else {
-                unreachable!()
-            }
-        })
-    }
-
-    /// Returns a reference to a given resource if it is currently loaded into memory, or `None`
-    /// otherwise.
-    ///
-    /// This does not check if the given resource actually exists within the resource file.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if the given ID is `0`, because that value is reserved for "deleted"
-    /// entries within a resource file's directory list. Use `Reader::contains_deleted_entries` to
-    /// determine if a resource file's directory list contains deleted entries.
-    pub fn loaded_resource(&self, id: usize) -> Option<&Resource> {
-        assert_ne!(id, 0);
-        self.resources.get(&id)
-    }
-
-    /// Loads a resource into memory.
-    ///
-    /// If the resource is already loaded, this method returns successfully without taking further
-    /// action.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if the given ID is `0`, because that value is reserved for "deleted"
-    /// entries within a resource file's directory list. Use `Reader::contains_deleted_entries` to
-    /// determine if a resource file's directory list contains deleted entries.
-    pub fn load_resource(&mut self, id: usize) -> Result<(), Error> {
-        assert_ne!(id, 0);
-        if self.resources.contains_key(&id) {
-            return Ok(());
+    /// Returns the first resource from a resource file whose corresponding entry in the directory
+    /// list matches a given predicate.
+    pub fn find_resource<P: Fn(&DirectoryEntry) -> bool>(
+        &mut self,
+        predicate: P,
+    ) -> Result<Resource, Error> {
+        let (index, entry) = self.directory_list
+            .entries()
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| (predicate)(&entry))
+            .ok_or(Error::ResourceNotFound)?;
+        if entry.is_compound_resource() || entry.is_compressed() {
+            unimplemented!()
         }
-        let mut file_offset = self.data_offset;
-        for entry in self.directory_list.iter() {
-            if entry.id() == id {
-                if entry.flags().contains(ResourceFlags::RDF_LZW) {
-                    unimplemented!()
-                }
-                let _ = self.source
-                    .seek(SeekFrom::Start(file_offset))
-                    .map_err(Error::IO)?;
-                let mut buffer = vec![0; entry.uncompressed_len()].into_boxed_slice();
-                self.source.read_exact(&mut buffer).map_err(Error::IO)?;
-                let _ = self.resources.insert(
-                    id,
-                    Resource {
-                        res_type: entry.resource_type(),
-                        flags: entry.flags(),
-                        data: buffer,
-                    },
-                );
-                return Ok(());
-            }
-            file_offset += entry.compressed_len() as u64;
-        }
-        Err(Error::ResourceNotFound)
+        let mut buffer = self.source
+            .seek(SeekFrom::Start(self.directory_list.offset_for_index(index)))
+            .map(|_| vec![0; entry.decompressed_len()].into_boxed_slice())
+            .map_err(Error::IO)?;
+        self.source
+            .read_exact(&mut buffer)
+            .map(|_| Resource {
+                metadata: *entry,
+                data: buffer,
+            })
+            .map_err(Error::IO)
     }
 }
 
@@ -234,9 +158,7 @@ impl<R: Debug> Debug for Reader<R> {
         f.debug_struct("Reader")
             .field("source", &self.source)
             .field("file_header", &self.file_header)
-            .field("data_offset", &self.data_offset)
             .field("directory_list", &self.directory_list)
-            .field("resources", &self.resources)
             .finish()
     }
 }
